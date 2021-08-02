@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.distributions as dist
+import torchvision.transforms as transforms
 import numpy as np
 import math
 
@@ -20,8 +22,8 @@ def init_params(model):
         else:
             nn.init.uniform_(p, 0.1, 0.2)
 
-def unif(x, y, device = 'cpu'):
-    return 2*torch.rand(x, y, device = device) - 1
+def unif(x, y, a = -1, b = 1, device = 'cpu'):
+    return (b-a)*torch.rand(x, y, device = device) + a
 
 def gaus(x, y, device = 'cpu'):
     return torch.normal(0, math.sqrt(2), size = (x,y)).to(device)
@@ -30,9 +32,64 @@ def h_sphere(x, y, device = 'cpu'):
     xyz = torch.normal(0, 1, size = (x,y))
     return (xyz/xyz.norm(dim = 1).unsqueeze(1)).to(device)
 
+def multinomial(x, y, device = 'cpu'):
+    return torch.eye(y)[torch.randint(y,(x,))].to(device)    
+
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
+    
+class lap_filter(nn.Module):
+    def __init__(self, input_channel = 1, device = 'cpu'):
+        super(lap_filter, self).__init__()
+        self.filter = nn.Conv2d(1, 1, kernel_size = 3, bias = False)
+        self.filter.weight = torch.nn.Parameter(torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]).unsqueeze(0).unsqueeze(0))
+        self.filter.to(device)
+        self.transform = None
+        if input_channel == 3:
+            self.transform = transforms.functional.rgb_to_grayscale
+    
+    def forward(self, x):
+        if self.transform is not None:
+            return self.filter(self.transform(x))
+        return self.filter(x)
+    
+def calculate_sharpness(dataset, batch_size = 256, labeled = False, device = 'cpu', num_workers = 8):
+    dataloader = torch.utils.data.DataLoader(dataset,
+                                             batch_size=batch_size,
+                                             shuffle=False,
+                                             drop_last=False,
+                                             num_workers=num_workers)
+
+    if labeled:
+        lap = lap_filter(input_channel = dataset[0][0].shape[0], device = device)
+        blurr = np.zeros(len(dataset))
+        for i, (data, label) in enumerate(dataloader):
+            if data.shape[0] == batch_size:
+                blurr[(i*batch_size):((i+1)*batch_size)] = lap(data.to(device)).var(axis = (1,2,3)).detach().to('cpu').numpy()
+            else: # last batch
+                blurr[(i*batch_size):len(dataset)] = lap(data.to(device)).var(axis = (1,2,3)).detach().to('cpu').numpy()
+    else:
+        lap = lap_filter(input_channel = dataset[0].shape[0], device = device)
+        blurr = np.zeros(len(dataset))
+        for i, data in enumerate(dataloader):
+            if data.shape[0] == batch_size:
+                blurr[(i*batch_size):((i+1)*batch_size)] = lap(data.to(device)).var(axis = (1,2,3)).detach().to('cpu').numpy()
+            else: # last batch
+                blurr[(i*batch_size):len(dataset)] = lap(data.to(device)).var(axis = (1,2,3)).detach().to('cpu').numpy()
+
+    return blurr
+
+def calculate_sharpness_generator(generator, z_sampler, batch_size=50, repeat = 10, device='cpu'):
+    blurr = np.empty(batch_size*repeat)
+    lap = lap_filter(input_channel = 3, device = device)
+
+    for i in range(repeat):
+        batch = generator(z_sampler(batch_size).to(device))
+        if batch.shape[1] == 1:
+            batch = batch.repeat((1,3,1,1))
+        blurr[(i*batch_size):((i+1)*batch_size)] = lap(batch.to(device)).var(axis=(1,2,3)).detach().to('cpu').numpy()
+    return blurr
 
 def make_swiss_roll(num_points,radius_scaling=0.0,num_periods=3,z_max=20.0):
     """

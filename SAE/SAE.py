@@ -38,11 +38,11 @@ class WAE_MMD_abstract(nn.Module):
         # Abstract Part. Need overriding here
         self.enc = nn.Identity()
         self.dec = nn.Identity()
-        self.z_dim = 1
         
         # Concrete Part.        
         self.device = device
         self.z_sampler = network_info['train']['z_sampler'] # generate prior
+        self.z_dim = network_info['train']['z_dim']
         self.train_data = network_info['train']['train_data'] 
         self.test_data = network_info['train']['test_data'] 
         self.batch_size = network_info['train']['batch_size'] 
@@ -80,10 +80,10 @@ class WAE_MMD_abstract(nn.Module):
         self.best_obj = [0, float('inf')]
         
     
+    # kernel for MMD
     def k(self, x, y, diag = True):
         stat = 0.
-        # for scale in [.1, .2, .5, 1., 2., 5., 10.]:
-        for scale in [1.]:
+        for scale in [.1, .2, .5, 1., 2., 5., 10.]:
             C = scale*2*self.z_dim*2
             kernel = (C/(C + (x.unsqueeze(0) - y.unsqueeze(1)).pow(2).sum(dim = 2)))
             if diag:
@@ -300,89 +300,444 @@ class WAE_MMD_abstract(nn.Module):
         if self.tensorboard_dir is not None:
             self.writer.close()
     
-    # def train(self):
-    #     self.train_mse_list = []
-    #     self.train_penalty_list = []
-    #     self.test_mse_list = []
-    #     self.test_penalty_list = []
+class CWAE_MMD_abstract(WAE_MMD_abstract):
+    def __init__(self, network_info, log, device = 'cpu', verbose = 1):
+        super(CWAE_MMD_abstract, self).__init__(network_info, log, device, verbose)
+        self.y_dim = network_info['train']['y_dim']
+        self.y_sampler = network_info['train']['y_sampler'] # generate label prior
         
-    #     mse = nn.MSELoss()
-    #     optimizer = optim.Adam(list(self.enc.parameters()) + list(self.dec.parameters()), 
-    #                                    lr = self.lr, betas = (self.beta1, 0.999))
+        # architecutres need overriding
+        self.embed_data = nn.Identity()
+        self.embed_label = nn.Identity()
+        self.enc = nn.Identity()
+        self.dec = nn.Identity()
         
-    #     self.enc.train()
-    #     self.dec.train()
+    def forward(self, x, y):
+        z = self.enc(torch.cat((self.embed_data(x), self.embed_label(y)), dim=1))
+        return self.dec(torch.cat((z,y), dim = 1))
         
-    #     for epoch in range(self.num_epoch):
-    #         # train_step
-    #         train_loss_mse = inc_avg()
-    #         train_loss_penalty = inc_avg()
+    def train(self):
+        self.train_mse_list = []
+        self.train_penalty_list = []
+        self.test_mse_list = []
+        self.test_penalty_list = []
+        
+        self.embed_data.train()
+        self.embed_label.train()
+        self.enc.train()
+        self.dec.train()
+        
+        # if self.encoder_pretrain:
+        #     self.pretrain_encoder()
+        #     self.log.info('Pretraining Ended!')
             
-    #         for i in range(self.iteration):
-    #             data = next(iter(self.train_generator))
-    #             self.enc.zero_grad()
-    #             self.dec.zero_grad()
-                
-    #             prior_z = self.z_sampler(len(data), self.z_dim, device = self.device).to(self.device)
-    #             x = data.to(self.device)
+        if self.tensorboard_dir is not None:
+            self.writer = SummaryWriter(self.tensorboard_dir)
+            
+        mse = nn.MSELoss()
+        optimizer = optim.Adam(list(self.embed_data.parameters()) + list(self.embed_label.parameters()) + list(self.enc.parameters()) + list(self.dec.parameters()), 
+                                       lr = self.lr, betas = (self.beta1, 0.999))
+        self.log.info('lr : %s' % get_lr(optimizer))
+        if self.lr_schedule is "manual":
+            lamb = lambda e: 1.0 * (0.5 ** (e >= 30)) * (0.2 ** (e >= 50)) * (0.1 ** (e >= 100))
+            scheduler = optim.lr_scheduler.LambdaLR(optimizer, lamb)
 
-    #             fake_latent = self.enc(x)
-    #             recon = self.dec(fake_latent)
+        self.log.info('------------------------------------------------------------')
+        self.log.info('Training Start!')
+        start_time = time.time()
+        
+        for epoch in range(self.num_epoch):
+            # train_step
+            # self.log.info('lr : %s' % get_lr(optimizer))
+            train_loss_mse = inc_avg()
+            train_loss_penalty = inc_avg()
+            
+            for i, (data, label) in enumerate(self.train_generator):
+                self.enc.zero_grad()
+                self.dec.zero_grad()
                 
-    #             loss = mse(x, recon)
-    #             penalty = self.emp_dist(fake_latent, prior_z, self.train_generator.batch_size)
+                prior = torch.cat((self.z_sampler(len(data), self.z_dim, device = self.device), self.y_sampler(len(label), self.y_dim, device = self.device)), dim = 1)
+                x = data.to(self.device)
+                y = label.to(self.device)
+                
+                z_hat = self.enc(torch.cat((self.embed_data(x), self.embed_label(y)), dim=1))
+                fake_latent = torch.cat((z_hat, y), dim = 1)
+                recon = self.dec(fake_latent)
 
-    #             obj = loss + self.lamb * penalty
-    #             obj.backward()
-    #             optimizer.step()
+                loss = mse(x, recon)
+                if self.lamb > 0:
+                    penalty = self.emp_dist(fake_latent, prior, self.train_generator.batch_size)
+                    obj = loss + self.lamb * penalty
+                else:
+                    obj = loss
+                obj.backward()
+                optimizer.step()
                 
-    #             train_loss_mse.append(loss.item(), len(data))
-    #             train_loss_penalty.append(penalty.item(), len(data))
+                train_loss_mse.append(loss.item(), len(data))
+                if self.lamb > 0:
+                    train_loss_penalty.append(penalty.item(), len(data))
                 
-    #             print('[%i/%i]\ttrain_mse: %.6e\ttrain_penalty: %.6e' % (i+1, self.iteration, train_loss_mse.avg, train_loss_penalty.avg), 
-    #                   end = "\r")
-                
-    #         self.train_mse_list.append(train_loss_mse.avg)
-    #         self.train_penalty_list.append(train_loss_penalty.avg)
+                print('[%i/%i]\ttrain_mse: %.4f\ttrain_penalty: %.4f' % (i+1, len(self.train_generator), train_loss_mse.avg, train_loss_penalty.avg), 
+                      end = "\r")
+
+                # if i+1 == self.iteration:
+                #     break
+
+            # print("\n", end = "\r")
+            self.train_mse_list.append(train_loss_mse.avg)
+            self.train_penalty_list.append(train_loss_penalty.avg)
+
+            if self.tensorboard_dir is not None:
+                self.writer.add_scalar('train/MSE', train_loss_mse.avg, epoch)
+                self.writer.add_scalar('train/penalty', train_loss_penalty.avg, epoch)
+                if self.hist:
+                    for param_tensor in self.state_dict():
+                        self.writer.add_histogram(param_tensor, self.state_dict()[param_tensor].detach().to('cpu').numpy().flatten(), epoch)
             
-    #         # validation_step
-    #         test_loss_mse = inc_avg()
-    #         test_loss_penalty = inc_avg()
-    #         if self.validate_batch:
-    #             for data in self.test_generator:
-    #                 prior_z = self.z_sampler(len(data), self.z_dim, device = self.device).to(self.device)
-    #                 x = data.to(self.device)
+            # validation_step
+            test_loss_mse = inc_avg()
+            test_loss_penalty = inc_avg()
+
+            if self.validate_batch:
+                for i, (data, label) in enumerate(self.test_generator):
+                    prior = torch.cat((self.z_sampler(len(data), self.z_dim, device = self.device), self.y_sampler(len(label), self.y_dim, device = self.device)), dim = 1)
+                    x = data.to(self.device)
+                    y = label.to(self.device)
                     
-    #                 fake_latent = self.enc(x).detach()
-    #                 recon = self.dec(fake_latent).detach()
+                    z_hat = self.enc(torch.cat((self.embed_data(x), self.embed_label(y)), dim=1))
+                    fake_latent = torch.cat((z_hat, y), dim = 1).detach()
+                    recon = self.dec(fake_latent).detach()
                     
-    #                 test_loss_mse.append(mse(x, recon).item(), len(data))
-    #                 test_loss_penalty.append(self.emp_dist(fake_latent, prior_z, self.test_generator.batch_size).item(), len(data))
+                    test_loss_mse.append(mse(x, recon).item(), len(data))
+
+                    if self.lamb > 0:
+                        test_loss_penalty.append(self.emp_dist(fake_latent, prior, self.test_generator.batch_size).item(), len(data))
+                    print('[%i/%i]\ttest_mse: %.4f\ttest_penalty: %.4f' % (i+1, len(self.test_generator), test_loss_mse.avg, test_loss_penalty.avg), end = "\r")
+
+                self.test_mse_list.append(test_loss_mse.avg)
+                self.test_penalty_list.append(test_loss_penalty.avg)
                 
-    #             self.test_mse_list.append(test_loss_mse.avg)
-    #             self.test_penalty_list.append(test_loss_penalty.avg)
-            
-    #             print('[%d/%d]\ttrain_mse: %.6e\ttrain_penalty: %.6e\ttest_mse: %.6e\ttest_penalty: %.6e'
-    #                   % (epoch + 1, self.num_epoch, train_loss_mse.avg, train_loss_penalty.avg, test_loss_mse.avg, test_loss_penalty.avg))
+                self.log.info('[%d/%d]\ttrain_mse: %.6e\ttrain_penalty: %.6e\ttest_mse: %.6e\ttest_penalty: %.6e'
+                      % (epoch + 1, self.num_epoch, train_loss_mse.avg, train_loss_penalty.avg, test_loss_mse.avg, test_loss_penalty.avg))
+                # print('[%d/%d]\ttrain_mse: %.6e\ttrain_penalty: %.6e\ttest_mse: %.6e\ttest_penalty: %.6e'
+                #       % (epoch + 1, self.num_epoch, train_loss_mse.avg, train_loss_penalty.avg, test_loss_mse.avg, test_loss_penalty.avg))
+
+                if self.tensorboard_dir is not None:
+                    self.writer.add_scalar('test/MSE', test_loss_mse.avg, epoch)
+                    self.writer.add_scalar('test/penalty', test_loss_penalty.avg, epoch)
+                    
+                    prior_z = torch.cat((self.z_sampler(len(data), self.z_dim, device = self.device), self.y_sampler(len(label), self.y_dim, device = self.device)), dim = 1)
+                    x = data.to(self.device)
+                    y = label.to(self.device)
+                    
+                    z_hat = self.enc(torch.cat((self.embed_data(x), self.embed_label(y)), dim=1))
+                    fake_latent = torch.cat((z_hat, y), dim = 1).detach()
+                    recon = self.dec(fake_latent).detach()
+
+                    if self.lamb > 0:
+                        # Embedding
+                        for_embed1 = fake_latent.to('cpu').numpy()
+                        for_embed2 = prior_z.to('cpu').numpy()
+                        label = ['fake']*len(for_embed1) + ['prior']*len(for_embed2)
+                        self.writer.add_embedding(np.concatenate((for_embed1, for_embed2)), metadata = label, global_step = epoch)
+
+                        # Sample Generation
+                        test_dec = self.dec(prior_z).detach().to('cpu').numpy()
+                        self.writer.add_images('generated_sample', (test_dec[0:32])*0.5 + 0.5, epoch)
+
+                    # Reconstruction
+                    self.writer.add_images('reconstruction', (np.concatenate((x.to('cpu').numpy()[0:16], recon.to('cpu').numpy()[0:16])))*0.5 + 0.5, epoch)
+                    self.writer.flush()
+                    
                 
-    #             if self.save_best:
-    #                 obj = test_loss_mse.avg + self.lamb * test_loss_penalty.avg
-    #                 if self.best_obj[1] > obj:
-    #                     self.best_obj[0] = epoch + 1
-    #                     self.best_obj[1] = obj
-    #                     self.save(self.save_path)
-    #                     print("model saved, obj: %.6e" % obj)
+                if self.save_best:
+                    obj = test_loss_mse.avg + self.lamb * test_loss_penalty.avg
+                    if self.best_obj[1] > obj:
+                        self.best_obj[0] = epoch + 1
+                        self.best_obj[1] = obj
+                        self.save(self.save_path)
+                        self.log.info("model saved, obj: %.6e" % obj)
+                else:
+                    self.save(self.save_path)
+                    # self.log.info("model saved at: %s" % self.save_path)
                         
-    #         if self.lamb_exp is not None:
-    #             self.lamb = self.lamb_exp * self.lamb
+            # if self.lamb_exp is not None:
+            #    self.lamb = self.lamb_exp * self.lamb
+                
+            if self.lr_schedule is not None:
+                scheduler.step()
             
-    #     if not self.validate_batch:
-    #         self.save(self.save_path)
-    #         print("model saved at: %s" % self.save_path)
-    #     elif not self.save_best:
-    #         self.save(self.save_path)
-    #         print("model saved at: %s" % self.save_path)
+        if not self.validate_batch:
+            self.save(self.save_path)
+            # self.log.info("model saved at: %s" % self.save_path)
 
+        self.log.info('Training Finished!')
+        self.log.info("Elapsed time: %.3fs" % (time.time() - start_time))
+
+        if self.tensorboard_dir is not None:
+            self.writer.close()
+
+# class WAE_GAN_abstract(nn.Module):
+#     def __init__(self, network_info, log, device = 'cpu', verbose = 1):
+#         super(WAE_MMD_abstract, self).__init__()
+#         self.log = log
+#         if verbose == 1:
+#             self.log.info('------------------------------------------------------------')
+#             for dd in network_info['train']:
+#                 self.log.info('%s : %s' % (dd, network_info['train'][dd]))
+
+#             for dd in network_info['path']:
+#                 self.log.info('%s : %s' % (dd, network_info['path'][dd]))
+        
+#         # Abstract Part. Need overriding here
+#         self.enc = nn.Identity()
+#         self.dec = nn.Identity()
+#         self.gen = nn.Identity()
+#         self.z_dim = 1
+        
+#         # Concrete Part.        
+#         self.device = device
+#         self.z_sampler = network_info['train']['z_sampler'] # generate prior
+#         self.train_data = network_info['train']['train_data'] 
+#         self.test_data = network_info['train']['test_data'] 
+#         self.batch_size = network_info['train']['batch_size'] 
+        
+#         self.train_generator = torch.utils.data.DataLoader(self.train_data, self.batch_size, num_workers = 5, shuffle = True, pin_memory=True, drop_last=True)
+#         self.test_generator = torch.utils.data.DataLoader(self.test_data, self.batch_size, num_workers = 5, shuffle = True, pin_memory=True, drop_last=True)
+        
+#         self.save_path = network_info['path']['save_path']
+#         self.save_best = network_info['path']['save_best']
+#         self.tensorboard_dir = network_info['path']['tb_logs']
+        
+#         self.n = self.train_generator.batch_size
+#         self.n_test = len(self.test_generator.dataset)
+#         self.validate_batch = network_info['train']['validate']
+        
+#         self.encoder_pretrain = network_info['train']['encoder_pretrain']
+#         if self.encoder_pretrain:
+#             self.encoder_pretrain_batch_size = network_info['train']['encoder_pretrain_batch_size']
+#             self.encoder_pretrain_step = network_info['train']['encoder_pretrain_max_step']
+#             self.pretrain_generator = torch.utils.data.DataLoader(self.train_data, self.encoder_pretrain_batch_size, num_workers = 5, shuffle = True, pin_memory=True, drop_last=True)
+        
+#         self.lr = network_info['train']['lr']
+#         self.beta1 = network_info['train']['beta1']
+#         self.lamb = network_info['train']['lambda']
+#         # self.lamb_exp = network_info['train']['lambda_exp']
+#         self.lr_schedule = network_info['train']['lr_schedule']
+        
+#         self.num_epoch = network_info['train']['epoch']
+#         self.iteration = network_info['train']['iter_per_epoch']
+        
+#         self.train_mse_list = []
+#         self.train_penalty_list = []
+#         self.test_mse_list = []
+#         self.test_penalty_list = []
+#         self.best_obj = [0, float('inf')]
+        
+#     def forward(self, x):
+#         return self.dec(self.enc(x))
+    
+#     def get_test_z(self, data):
+#         return self.enc(data)
+    
+#     def generate(self, n):
+#         return self.enc(self.z_sampler(n, self.z_dim, device = self.device))
+
+#     def save(self, dir):
+#         torch.save(self.state_dict(), dir)
+
+#     def load(self, dir):
+#         self.load_state_dict(torch.load(dir))
+        
+#     def pretrain_encoder(self):
+#         optimizer = optim.Adam(list(self.enc.parameters()), lr = self.lr, betas = (self.beta1, 0.999))
+#         mse = nn.MSELoss()
+        
+#         self.log.info('------------------------------------------------------------')
+#         self.log.info('Pretraining Start!')
+        
+#         cur_step = 0
+#         break_ind = False
+#         while True:
+#             for i, data in enumerate(self.pretrain_generator):
+#                 cur_step = cur_step + 1
+#                 pz = self.z_sampler(len(data), self.z_dim, device = self.device)
+#                 x = data.to(self.device)
+#                 qz = self.enc(x)
+
+#                 qz_mean = torch.mean(qz, dim = 0)
+#                 pz_mean = torch.mean(pz, dim = 0)
+
+#                 qz_cov = torch.mean(torch.matmul((qz - qz_mean).unsqueeze(2), (qz - qz_mean).unsqueeze(1)), dim = 0)
+#                 pz_cov = torch.mean(torch.matmul((pz - pz_mean).unsqueeze(2), (pz - pz_mean).unsqueeze(1)), dim = 0)
+
+#                 loss = mse(pz_mean, qz_mean) + mse(pz_cov, qz_cov)
+
+#                 loss.backward()
+#                 optimizer.step()
+                
+#                 # train_loss_mse.append(loss.item(), len(data))
+#                 if loss.item() > 0.1 or cur_step < 10:
+#                     print('train_mse: %.4f at %i step' % (loss.item(), cur_step), end = "\r")
+#                 else:
+#                     self.log.info('train_mse: %.4f at %i step' % (loss.item(), cur_step))
+#                     break_ind = True
+#                     break
+                    
+#             if break_ind or cur_step >= self.encoder_pretrain_step:
+#                 break
+
+#     def train(self):
+#         self.train_mse_list = []
+#         self.train_penalty_list = []
+#         self.test_mse_list = []
+#         self.test_penalty_list = []
+        
+#         self.enc.train()
+#         self.dec.train()
+            
+#         if self.encoder_pretrain:
+#             self.pretrain_encoder()
+#             self.log.info('Pretraining Ended!')
+            
+#         if self.tensorboard_dir is not None:
+#             self.writer = SummaryWriter(self.tensorboard_dir)
+            
+#         mse = nn.MSELoss()
+#         optimizer = optim.Adam(list(self.enc.parameters()) + list(self.dec.parameters()), 
+#                                        lr = self.lr, betas = (self.beta1, 0.999))
+#         self.log.info('lr : %s' % get_lr(optimizer))
+#         if self.lr_schedule is "manual":
+#             lamb = lambda e: 1.0 * (0.5 ** (e >= 30)) * (0.2 ** (e >= 50)) * (0.1 ** (e >= 100))
+#             scheduler = optim.lr_scheduler.LambdaLR(optimizer, lamb)
+
+#         self.log.info('------------------------------------------------------------')
+#         self.log.info('Training Start!')
+#         start_time = time.time()
+        
+#         for epoch in range(self.num_epoch):
+#             # train_step
+#             # self.log.info('lr : %s' % get_lr(optimizer))
+#             train_loss_mse = inc_avg()
+#             train_loss_penalty = inc_avg()
+            
+#             for i, data in enumerate(self.train_generator):
+#                 self.enc.zero_grad()
+#                 self.dec.zero_grad()
+                
+#                 prior_z = self.z_sampler(len(data), self.z_dim, device = self.device)
+#                 x = data.to(self.device)
+
+#                 fake_latent = self.enc(x)
+#                 recon = self.dec(fake_latent)
+                
+#                 loss = mse(x, recon)
+#                 if self.lamb > 0:
+#                     penalty = self.emp_dist(fake_latent, prior_z, self.train_generator.batch_size)
+#                     obj = loss + self.lamb * penalty
+#                 else:
+#                     obj = loss
+#                 obj.backward()
+#                 optimizer.step()
+                
+#                 train_loss_mse.append(loss.item(), len(data))
+#                 if self.lamb > 0:
+#                     train_loss_penalty.append(penalty.item(), len(data))
+                
+#                 print('[%i/%i]\ttrain_mse: %.4f\ttrain_penalty: %.4f' % (i+1, len(self.train_generator), train_loss_mse.avg, train_loss_penalty.avg), 
+#                       end = "\r")
+
+#                 # if i+1 == self.iteration:
+#                 #     break
+
+#             # print("\n", end = "\r")
+#             self.train_mse_list.append(train_loss_mse.avg)
+#             self.train_penalty_list.append(train_loss_penalty.avg)
+
+#             if self.tensorboard_dir is not None:
+#                 self.writer.add_scalar('train/MSE', train_loss_mse.avg, epoch)
+#                 self.writer.add_scalar('train/penalty', train_loss_penalty.avg, epoch)
+#                 if self.hist:
+#                     for param_tensor in self.state_dict():
+#                         self.writer.add_histogram(param_tensor, self.state_dict()[param_tensor].detach().to('cpu').numpy().flatten(), epoch)
+            
+#             # validation_step
+#             test_loss_mse = inc_avg()
+#             test_loss_penalty = inc_avg()
+
+#             if self.validate_batch:
+#                 for i, data in enumerate(self.test_generator):
+#                     prior_z = self.z_sampler(len(data), self.z_dim, device = self.device).to(self.device)
+#                     x = data.to(self.device)
+                    
+#                     fake_latent = self.enc(x).detach()
+#                     recon = self.dec(fake_latent).detach()
+#                     test_loss_mse.append(mse(x, recon).item(), len(data))
+
+#                     if self.lamb > 0:
+#                         test_loss_penalty.append(self.emp_dist(fake_latent, prior_z, self.test_generator.batch_size).item(), len(data))
+#                     print('[%i/%i]\ttest_mse: %.4f\ttest_penalty: %.4f' % (i, len(self.test_generator), test_loss_mse.avg, test_loss_penalty.avg), end = "\r")
+
+#                 self.test_mse_list.append(test_loss_mse.avg)
+#                 self.test_penalty_list.append(test_loss_penalty.avg)
+                
+#                 self.log.info('[%d/%d]\ttrain_mse: %.6e\ttrain_penalty: %.6e\ttest_mse: %.6e\ttest_penalty: %.6e'
+#                       % (epoch + 1, self.num_epoch, train_loss_mse.avg, train_loss_penalty.avg, test_loss_mse.avg, test_loss_penalty.avg))
+#                 # print('[%d/%d]\ttrain_mse: %.6e\ttrain_penalty: %.6e\ttest_mse: %.6e\ttest_penalty: %.6e'
+#                 #       % (epoch + 1, self.num_epoch, train_loss_mse.avg, train_loss_penalty.avg, test_loss_mse.avg, test_loss_penalty.avg))
+
+#                 if self.tensorboard_dir is not None:
+#                     self.writer.add_scalar('test/MSE', test_loss_mse.avg, epoch)
+#                     self.writer.add_scalar('test/penalty', test_loss_penalty.avg, epoch)
+                    
+#                     prior_z = self.z_sampler(self.test_generator.batch_size, self.z_dim, device = self.device)
+#                     data = next(iter(self.test_generator))
+#                     x = data.to(self.device)
+#                     fake_latent = self.enc(x).detach()
+#                     recon = self.dec(fake_latent).detach()
+
+#                     if self.lamb > 0:
+#                         # Embedding
+#                         for_embed1 = fake_latent.to('cpu').numpy()
+#                         for_embed2 = prior_z.to('cpu').numpy()
+#                         label = ['fake']*len(for_embed1) + ['prior']*len(for_embed2)
+#                         self.writer.add_embedding(np.concatenate((for_embed1, for_embed2)), metadata = label, global_step = epoch)
+
+#                         # Sample Generation
+#                         test_dec = self.dec(prior_z).detach().to('cpu').numpy()
+#                         self.writer.add_images('generated_sample', (test_dec[0:32])*0.5 + 0.5, epoch)
+
+#                     # Reconstruction
+#                     self.writer.add_images('reconstruction', (np.concatenate((x.to('cpu').numpy()[0:16], recon.to('cpu').numpy()[0:16])))*0.5 + 0.5, epoch)
+#                     self.writer.flush()
+                    
+                
+#                 if self.save_best:
+#                     obj = test_loss_mse.avg + self.lamb * test_loss_penalty.avg
+#                     if self.best_obj[1] > obj:
+#                         self.best_obj[0] = epoch + 1
+#                         self.best_obj[1] = obj
+#                         self.save(self.save_path)
+#                         self.log.info("model saved, obj: %.6e" % obj)
+#                 else:
+#                     self.save(self.save_path)
+#                     # self.log.info("model saved at: %s" % self.save_path)
+                        
+#             # if self.lamb_exp is not None:
+#             #    self.lamb = self.lamb_exp * self.lamb
+                
+#             if self.lr_schedule is not None:
+#                 scheduler.step()
+            
+#         if not self.validate_batch:
+#             self.save(self.save_path)
+#             # self.log.info("model saved at: %s" % self.save_path)
+
+#         self.log.info('Training Finished!')
+#         self.log.info("Elapsed time: %.3fs" % (time.time() - start_time))
+
+#         if self.tensorboard_dir is not None:
+#             self.writer.close()
             
 class WAE_MMD_swiss(WAE_MMD_abstract):
     def __init__(self, network_info, log, device = 'cpu', verbose = 1):

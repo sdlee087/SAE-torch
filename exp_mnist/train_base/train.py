@@ -16,10 +16,11 @@ from SAE.logging_daily import logging_daily
 class WAE_MMD_MNIST(WAE_MMD_abstract):
     def __init__(self, network_info, log, device = 'cpu', verbose = 1):
         super(WAE_MMD_MNIST, self).__init__(network_info, log, device, verbose)
-        self.d = 128
+        self.d = 64
         d = self.d
         self.z_dim = network_info['train']['z_dim']
-        self.enc = nn.Sequential(
+        
+        self.enc = self.d_sample = nn.Sequential(
             nn.Conv2d(1, d, kernel_size = 4, stride = 2, padding = 1, bias = False),
             nn.BatchNorm2d(d),
             nn.ReLU(True),
@@ -37,26 +38,27 @@ class WAE_MMD_MNIST(WAE_MMD_abstract):
             nn.ReLU(True),
             
             nn.Flatten(),
-            nn.Linear(8*d, 8),
+            nn.Linear(8*d, self.z_dim),
             ).to(device)
+        
         self.dec = nn.Sequential(
-            
             nn.Linear(8, 49*8*d),
             nn.Unflatten(1, (8*d, 7, 7)),
             
-            nn.ConvTranspose2d(8*d, 4*d, kernel_size = 4, bias = False),
+            nn.ConvTranspose2d(8*d, 4*d, kernel_size = 4, stride = 2, padding = 1, bias = False),
             nn.BatchNorm2d(4*d),
             nn.ReLU(True),
             
-            nn.ConvTranspose2d(4*d, 2*d, kernel_size = 4, bias = False),
+            nn.ConvTranspose2d(4*d, 2*d, kernel_size = 4, stride = 2, padding = 1, bias = False),
             nn.BatchNorm2d(2*d),
             nn.ReLU(True),
             
             # reconstruction
-            nn.ConvTranspose2d(2*d, 1, kernel_size = 4, stride = 2),
+            nn.Conv2d(2*d, 1, kernel_size = 3, padding = 1),
             nn.Tanh(),
             
             ).to(device)
+        
         init_params(self.enc)
         init_params(self.dec)
 
@@ -103,8 +105,6 @@ if __name__ == '__main__':
             'lambda':10.0,
             
             'lr_schedule':"manual",
-            'eps':1.0,
-            'L':40,
             'validate':True,
             'histogram':True,
             
