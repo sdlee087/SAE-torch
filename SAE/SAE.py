@@ -803,7 +803,7 @@ class SAE_abstract(WAE_MMD_abstract):
     def get_penalty(self):
         for data in self.test_generator:
             prior_z = self.z_sampler(len(data), self.z_dim, device = self.device)
-            x = data.to(device)
+            x = data.to(self.device)
             fake_latent = self.enc(x).detach()
 
             return self.emp_dist(fake_latent, prior_z, self.test_generator.batch_size).item()
